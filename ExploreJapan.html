@@ -257,6 +257,8 @@ flex:1;
 background:linear-gradient(135deg,var(--gold),var(--gold2));
 color:#000;
 }
+.ar-btn.ready-pulse{animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 6px rgba(212,174,82,.35)}}
 
 .scroll-dots{
 display:flex;
@@ -272,6 +274,27 @@ background:rgba(184,151,58,.25)
 background:var(--gold2);
 transform:scale(1.35)
 }
+
+.toast{
+position:fixed;
+left:50%;
+bottom:max(env(safe-area-inset-bottom),56px);
+transform:translateX(-50%) translateY(20px);
+max-width:88vw;
+background:rgba(8,6,4,.95);
+border:1px solid var(--gold);
+color:var(--paper);
+padding:12px 18px;
+border-radius:14px;
+font-size:12px;
+line-height:1.4;
+text-align:center;
+opacity:0;
+pointer-events:none;
+transition:.35s;
+z-index:200;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 </style>
 </head>
 <body>
@@ -285,6 +308,7 @@ transform:scale(1.35)
 
 <div class="explorer-grid" id="grid"></div>
 <div class="scroll-dots" id="dots"></div>
+<div class="toast" id="toast"></div>
 
 <script>
 const landmarks=[
@@ -296,21 +320,31 @@ const landmarks=[
 {name:'Kimono Dress',city:'Japan',folder:'dress',file:'dress',hasUsdz:true}
 ];
 
+const AR_LABEL='🪐 View in Real World';
 const grid=document.getElementById('grid');
 const dotsEl=document.getElementById('dots');
+const toastEl=document.getElementById('toast');
 
-const isIOS=/iPhone|iPad|iPod/i.test(navigator.userAgent)||
-(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+let toastTimer;
+function toast(msg){
+toastEl.textContent=msg;
+toastEl.classList.add('show');
+clearTimeout(toastTimer);
+toastTimer=setTimeout(()=>toastEl.classList.remove('show'),4500);
+}
 
+/* FIX: encode spaces etc. so Scene Viewer / Quick Look get valid URLs */
 landmarks.forEach((l,i)=>{
 const base=`ExploreJapan/${l.folder}/${l.file}`;
-const glbPath=`${base}.glb`;
-const usdzPath=`${base}.usdz`;
-const pngPath=`${base}.png`;
+const glbPath=encodeURI(`${base}.glb`);
+const usdzPath=encodeURI(`${base}.usdz`);
+const pngPath=encodeURI(`${base}.png`);
 
 const card=document.createElement('div');
 card.className='landmark-card';
+card.dataset.index=i;
 
+/* FIX: let model-viewer choose the right AR mode per device */
 card.innerHTML=`
 <div class="model-wrap" id="wrap-${i}">
 
@@ -319,28 +353,24 @@ card.innerHTML=`
 <model-viewer
 id="mv-${i}"
 src="${glbPath}"
-${isIOS&&l.hasUsdz?`ios-src="${usdzPath}"`:''}
+${l.hasUsdz?`ios-src="${usdzPath}"`:''}
 ar
-ar-modes="${isIOS?'quick-look webxr':'scene-viewer webxr'}"
+ar-modes="webxr scene-viewer quick-look"
 ar-placement="floor"
-
 ar-scale="auto"
-
-loading="${i===0?'eager':'lazy'}"
-reveal="interaction"
+loading="lazy"
 environment-image="neutral"
 shadow-intensity="1.2"
 shadow-softness="0.8"
 exposure="1.1"
-
 camera-controls
 touch-action="pan-y"
-
 min-camera-orbit="auto auto 8%"
 max-camera-orbit="auto auto 900%"
 field-of-view="18deg"
 interpolation-decay="200"
-interaction-prompt="none">
+interaction-prompt="none"
+alt="${l.name} 3D model">
 </model-viewer>
 
 <div class="ar-loading" id="arload-${i}">
@@ -358,7 +388,7 @@ interaction-prompt="none">
 <div class="landmark-city">${l.city}</div>
 <div class="btn-row">
 <button class="action-btn view3d-btn" id="v3dbtn-${i}" onclick="toggle3D(${i})">⬡ 3D</button>
-<button class="action-btn ar-btn" id="arbtn-${i}" onclick="launchAR(${i})">🪐 View in Real World</button>
+<button class="action-btn ar-btn" id="arbtn-${i}" onclick="launchAR(${i})">${AR_LABEL}</button>
 </div>
 </div>`;
 
@@ -371,6 +401,13 @@ dotsEl.appendChild(dot);
 
 const state={};
 
+function startLoad(i){
+const s=state[i];
+if(!s||s.ready||s.loading||s.failed)return;
+s.loading=true;
+s.mv.setAttribute('loading','eager');
+}
+
 requestAnimationFrame(()=>{
 landmarks.forEach((l,i)=>{
 const mv=document.getElementById(`mv-${i}`);
@@ -382,7 +419,9 @@ const arbtn=document.getElementById(`arbtn-${i}`);
 const v3dbtn=document.getElementById(`v3dbtn-${i}`);
 const wrap=document.getElementById(`wrap-${i}`);
 
-state[i]={mv,arload,bar,lbl,badge,arbtn,v3dbtn,wrap,ready:false,loading:false,showing3D:false};
+state[i]={mv,arload,bar,lbl,badge,arbtn,v3dbtn,wrap,
+ready:false,loading:false,failed:false,showing3D:false,
+pending3D:false,waitingAR:false};
 
 mv.addEventListener('progress',(e)=>{
 const pct=Math.round(e.detail.totalProgress*100);
@@ -396,17 +435,52 @@ s.ready=true;
 s.loading=false;
 arload.classList.remove('show');
 badge.classList.add('visible');
-if(s.pending3D){s.pending3D=false;activate3DView(i)}
-if(s.pendingAR){s.pendingAR=false;mv.activateAR()}
+
+if(s.pending3D){s.pending3D=false;activate3DView(i);}
+
+/* FIX: never call activateAR() from an async event — the browser blocks
+   it because there's no user tap. Ask for a fresh tap instead. */
+if(s.waitingAR){
+s.waitingAR=false;
+arbtn.innerHTML='✦ Tap to Launch AR';
+arbtn.classList.add('ready-pulse');
+}
 });
 
 mv.addEventListener('error',()=>{
+const s=state[i];
+s.failed=true;
+s.loading=false;
+s.waitingAR=false;
+s.pending3D=false;
 arload.classList.remove('show');
 arbtn.disabled=true;
 v3dbtn.disabled=true;
 arbtn.innerHTML='Unavailable';
+console.error('Model failed to load:',mv.src);
+});
+
+mv.addEventListener('ar-status',(e)=>{
+if(e.detail.status==='failed'){
+toast('Could not start AR. Allow camera access and use Safari (iPhone) or Chrome (Android).');
+}
 });
 });
+
+/* Preload the model on screen + the next one, so it is ready before the tap */
+const io=new IntersectionObserver((entries)=>{
+entries.forEach(en=>{
+if(en.isIntersecting){
+const i=+en.target.dataset.index;
+startLoad(i);
+startLoad(i+1);
+}
+});
+},{root:grid,threshold:0.5});
+grid.querySelectorAll('.landmark-card').forEach(c=>io.observe(c));
+
+startLoad(0);
+startLoad(1);
 });
 
 function activate3DView(i){
@@ -415,7 +489,6 @@ s.showing3D=true;
 s.wrap.classList.add('model-active');
 s.v3dbtn.classList.add('is-active');
 s.v3dbtn.innerHTML='✕ 2D';
-s.wrap.addEventListener('touchstart',stopScrollPropagation,{passive:false});
 }
 
 function deactivate3DView(i){
@@ -424,43 +497,42 @@ s.showing3D=false;
 s.wrap.classList.remove('model-active');
 s.v3dbtn.classList.remove('is-active');
 s.v3dbtn.innerHTML='⬡ 3D';
-s.wrap.removeEventListener('touchstart',stopScrollPropagation);
-}
-
-function stopScrollPropagation(e){
-e.stopPropagation();
 }
 
 function toggle3D(i){
 const s=state[i];
-if(s.showing3D){
-deactivate3DView(i);
-return;
-}
+if(s.failed)return;
+if(s.showing3D){deactivate3DView(i);return;}
 if(s.ready){
 activate3DView(i);
-}else if(!s.loading){
-s.loading=true;
-s.pending3D=true;
-s.mv.setAttribute('loading','eager');
-s.arload.classList.add('show');
 }else{
 s.pending3D=true;
+startLoad(i);
+s.arload.classList.add('show');
 }
 }
 
 function launchAR(i){
 const s=state[i];
-if(s.ready){
-s.mv.activateAR();
-}else if(!s.loading){
-s.loading=true;
-s.pendingAR=true;
-s.mv.setAttribute('loading','eager');
+if(s.failed)return;
+
+if(!s.ready){
+/* Model still loading: start loading and wait for the user's next tap */
+s.waitingAR=true;
+startLoad(i);
 s.arload.classList.add('show');
-}else{
-s.pendingAR=true;
+return;
 }
+
+if(!s.mv.canActivateAR){
+toast('AR is not supported here. Use Safari on iPhone or Chrome on Android (HTTPS), not an in-app browser.');
+return;
+}
+
+s.arbtn.classList.remove('ready-pulse');
+s.arbtn.innerHTML=AR_LABEL;
+/* Called directly inside the tap handler = allowed to open the camera */
+s.mv.activateAR();
 }
 
 const dots=dotsEl.querySelectorAll('.dot');
